@@ -1,6 +1,10 @@
 # This file creates a vm a storage account and a service endpoint in a subnet to connect the vm to a storage account
 #____________________________________________________________________________________________________________________
 # Local.tf: This files setsup the local variables
+
+resource "random_uuid" "storagename" {
+}
+# This generates a unique random number that is used to setup a unique storage account name
 locals {
   resource_group_name = "app-grp"
   location = "Central India"
@@ -9,7 +13,10 @@ locals {
     address_space = "10.0.0.0/16"
   }
   virtual_machine_name = "app-vm"
-  storage_account_name = "vmstore890321"
+  storage_account_name = lower("appstore${substr(random_uuid.storagename.result,0,4)}")
+
+  depends_on = [random_uuid.storagename]
+
 }
 #_____________________________________________________________________________________________________________________
 # Variable.tf: this file sets up numbers of certain resourecs to be created
