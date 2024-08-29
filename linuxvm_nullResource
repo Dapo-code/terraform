@@ -1,0 +1,250 @@
+# This file creates a linux vm and uses cloud_init file in a custom extension to install nginx. It also uses the null_resource resource block to carry out a task of copying a default.html file to the 
+# /var/www/html folder in linux. 
+#_____________________________________________________________________________________________________________________________________________________
+# virtualmachine.tf file: This file cleates a linux virtual machine and install nginx via a custom script via a base64encode cloud_init file.
+#
+resource "azurerm_network_interface" "appinterface" {
+  count = var.number_of_machines
+  name                = "app-interface${count.index}"
+  location            = local.location
+  resource_group_name = local.resource_group_name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnets[count.index].id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id = azurerm_public_ip.appip[count.index].id
+  }
+
+  depends_on = [ azurerm_subnet.subnets, azurerm_public_ip.appip ]
+}
+
+
+resource "azurerm_public_ip" "appip" {
+  count = var.number_of_machines
+  name                = "app-ip${count.index}"
+  resource_group_name = local.resource_group_name
+  location            = local.location
+  allocation_method   = "Static"
+
+  depends_on = [ azurerm_resource_group.appgrp ]
+
+}
+
+resource "tls_private_key" "linuxkey" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "local_file" "linuxpemkey"{
+  filename = "linuxkey.pem"
+  content=tls_private_key.linuxkey.private_key_pem
+  depends_on = [
+    tls_private_key.linuxkey
+  ]
+}
+
+data "template_file" "cloudinitdata" {
+    template = file("script.sh")
+}
+
+resource "azurerm_linux_virtual_machine" "linuxvm" {
+  count = var.number_of_machines
+  name                = local.virtual_machine_name
+  resource_group_name = local.resource_group_name
+  location            = local.location
+  size                = "Standard_D2s_v3"
+  admin_username      = "dapo"
+  custom_data = base64encode(data.template_file.cloudinitdata.rendered)
+  network_interface_ids = [
+    azurerm_network_interface.appinterface[count.index].id
+    ]
+
+   admin_ssh_key {
+     username="dapo"
+     public_key = tls_private_key.linuxkey.public_key_openssh
+   }
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts"
+    version   = "latest"
+  }
+  depends_on = [
+    azurerm_network_interface.appinterface,
+    azurerm_resource_group.appgrp,
+    tls_private_key.linuxkey
+    
+  ]
+}
+
+
+#_____________________________________________________________________________________________________________________________________________________
+# The null_resource block is used to carry out a task without creating a resource on the azure platform
+# This very resource copies the default.html file into a folder on the linux vm
+resource "null_resource" "addfiles" {
+  provisioner "file" {
+    source = "Default.html"
+    destination = "/var/www/html/Default.html"
+
+    connection {
+      type = "ssh"
+      user = "dapo"
+      private_key = file("${local_file.linuxpemkey.filename}")
+      host = "${azurerm_public_ip.appip[0].ip_address}"
+    }
+  }
+
+  depends_on = [ azurerm_linux_virtual_machine.linuxvm, local_file.linuxpemkey]
+}
+
+# or you can use the same concept to install nginx
+/*
+resource "null_resource" "addfiles" {
+  provisioner "remote-exec" {
+    inline = [ 
+        "sudo apt-get update",
+        "sudo apt-get install nginx -y"
+     ]
+     
+    connection {
+      type = "ssh"
+      user = "dapo"
+      private_key = file("${local_file.linuxpemkey.filename}")
+      host = "${azurerm_public_ip.appip[0].ip_address}"
+    }
+  }
+
+  depends_on = [ azurerm_linux_virtual_machine.linuxvm, local_file.linuxpemkey]
+}
+*/
+#_____________________________________________________________________________________________________________________________________________________
+
+resource "azurerm_virtual_network" "appnetwork" {
+  name                = local.virtual_network.name
+  location            = azurerm_resource_group.appgrp.location
+  resource_group_name = azurerm_resource_group.appgrp.name
+  address_space       = [local.virtual_network.address_space]
+ 
+  depends_on = [ azurerm_resource_group.appgrp ]
+  }
+
+resource "azurerm_subnet" "subnets" {
+  count = var.number_of_subnets
+  name                 = "subnets${count.index}"
+  resource_group_name  = local.resource_group_name
+  virtual_network_name = local.virtual_network.name
+  address_prefixes     = ["10.0.${count.index}.0/24"]
+  service_endpoints = [ "Microsoft.Storage" ]
+
+  depends_on = [ azurerm_virtual_network.appnetwork ]
+}
+
+resource "azurerm_network_security_group" "appnsg" {
+  name                = "app-nsg"
+  location            = local.location
+  resource_group_name = local.resource_group_name
+
+  security_rule {
+    name                       = "allowRDP"
+    priority                   = 300
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "allowHTTP"
+    priority                   = 400
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  depends_on = [ azurerm_resource_group.appgrp ]
+
+}
+
+resource "azurerm_subnet_network_security_group_association" "appnsglink" {
+  count = var.number_of_subnets
+  subnet_id = azurerm_subnet.subnets[count.index].id
+  network_security_group_id = azurerm_network_security_group.appnsg.id
+
+  depends_on = [ azurerm_network_security_group.appnsg ]
+}
+
+
+
+#_____________________________________________________________________________________________________________________________________________________
+/* This file creates a vm with two network interface and an extra data disk of 16GB
+*/
+
+resource "azurerm_resource_group" "appgrp" {
+  name     = local.resource_group_name
+  location = local.location
+}
+
+
+#_____________________________________________________________________________________________________________________________________________________
+resource "random_uuid" "storagename" {
+}
+
+locals {
+  resource_group_name = "app-grp"
+  location = "Central India"
+  virtual_network = {
+    name = "app-network"
+    address_space = "10.0.0.0/16"
+  }
+  virtual_machine_name = "linux-vm"
+  storage_account_name = lower("appstore${substr(random_uuid.storagename.result,0,4)}")
+
+  depends_on = [random_uuid.storagename]
+
+}
+#_____________________________________________________________________________________________________________________________________________________
+variable "number_of_subnets" {
+    type = number
+    description = "This defines the number os subnets in a network"
+    default = 2 
+    validation {
+      condition = var.number_of_subnets < 5
+      error_message = "The number of subnets must be less than 5."
+    }
+}
+
+variable "number_of_machines" {
+    type = number
+    description = "this defines the number of Virtual machines"
+    default = 2
+    validation {
+      condition = var.number_of_machines < 5
+      error_message = "The number of machines must be less than 5"
+    }
+
+  
+}
+
+#_____________________________________________________________________________________________________________________________________________________
+# script.sh file
+
+#cloud-config
+package_upgrade: true
+packages:
+  - nginx
+runcmd:
+  - cd /var/www
+  - sudo chmod 0757 html
